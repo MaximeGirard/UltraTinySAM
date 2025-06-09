@@ -115,6 +115,8 @@ python export_utsam.py --config configs/ultratinysam/UltraTinySAM.yaml --model_c
 python export_utsam.py --config configs/ultratinysam/UltraTinySAM.yaml --model_checkpoint checkpoints/utsam.pt --export_quant --static_point --labels_mode 1-click
 ```
 
+A ready to deploy exported ONNX is available in the repo.
+
 ---
 
 ## 📊 Evaluation
