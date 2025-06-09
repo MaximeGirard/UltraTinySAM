@@ -1,0 +1,3 @@
+rm -r ~/miniconda3/envs/UltraTinySAM/lib/python3.11/site-packages/sam2 && cp -r sam2_modified ~/miniconda3/envs/UltraTinySAM/lib/python3.11/site-packages/sam2
+rm -r ~/miniconda3/envs/UltraTinySAM/lib/python3.11/site-packages/training && cp -r training_modified ~/miniconda3/envs/UltraTinySAM/lib/python3.11/site-packages/training
+rm -r ~/miniconda3/envs/UltraTinySAM/lib/python3.11/site-packages/model_compression_toolkit && cp -r model_compression_toolkit_modified ~/miniconda3/envs/UltraTinySAM/lib/python3.11/site-packages/model_compression_toolkit
