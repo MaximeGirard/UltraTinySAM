@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
-"""
-SAM Model Evaluation Script
-Evaluates Segment Anything Model (SAM) variants on COCO/LVIS datasets.
-"""
+# UltraTinySAM export script for IMX500 deployment
+# Made by: Maxime Girard, 2025
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
 
 import argparse
 import os
