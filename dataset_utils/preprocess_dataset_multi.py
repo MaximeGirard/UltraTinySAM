@@ -1,22 +1,42 @@
-import os
+import argparse
 import json
+import os
 import shutil
 import tarfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+import numpy as np
+import requests
 from PIL import Image
 from pycocotools import mask as mask_utils
-import numpy as np
 from tqdm import tqdm
-import requests
-from concurrent.futures import ProcessPoolExecutor
+
 
 # PARAMETERS
-TARGET_DIR = '/datasets/magirard/SA1B_preprocessed_up_150'
-TEMP_EXTRACT_DIR = '/datasets/magirard/temp_extract'
-IMAGE_SIZE = (128, 128)
-AREA_MIN = 150
-NUM_WORKERS = 12
-TO_DOWNLOAD_FILE = '/datasets/magirard/to_download.txt'
+def parse_args():
+    parser = argparse.ArgumentParser(description="Preprocess SA-1B dataset tars with resizing and filtering.")
+    parser.add_argument('--target-dir', type=str, default='datasets/SA1B_preprocessed_up_150',
+                        help='Directory to save preprocessed images and annotations.')
+    parser.add_argument('--temp-extract-dir', type=str, default='/datasets/magirard/temp_extract',
+                        help='Temporary directory for extracting tar files.')
+    parser.add_argument('--image-size', type=int, nargs=2, default=[128, 128],
+                        help='Output image size as two integers: width height.')
+    parser.add_argument('--area-min', type=int, default=150,
+                        help='Minimum area for valid masks. Default is 150.')
+    parser.add_argument('--num-workers', type=int, default=12,
+                        help='Number of parallel workers.')
+    parser.add_argument('--to-download-file', type=str, default='datasets/to_download.txt',
+                        help='Path to file listing tar files to download and process.')
+    return parser.parse_args()
+
+args = parse_args()
+TARGET_DIR = args.target_dir
+TEMP_EXTRACT_DIR = args.temp_extract_dir
+IMAGE_SIZE = tuple(args.image_size)
+AREA_MIN = args.area_min
+NUM_WORKERS = args.num_workers
+TO_DOWNLOAD_FILE = args.to_download_file
 
 os.makedirs(TARGET_DIR, exist_ok=True)
 os.makedirs(TEMP_EXTRACT_DIR, exist_ok=True)
