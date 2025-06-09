@@ -2,16 +2,16 @@
 
 scratch:
   resolution: 128
-  train_batch_size: 64
-  val_batch_size: 128
+  train_batch_size: 100
+  val_batch_size: 100
   num_train_workers: 12
   num_val_workers: 6
   num_frames: 8
   max_num_objects: 3
-  base_lr: 3.0e-5
-  vision_lr: 5.0e-5
+  base_lr: 3.0e-4
+  vision_lr: 3.0e-4
   phases_per_epoch: 1
-  num_epochs: 1500
+  num_epochs: 100
 
 model_params:
   input_size: 128
@@ -22,8 +22,6 @@ model_params:
 dataset:
   # PATHS to Dataset
   train:
-    # img_folder: /datasets/magirard/SA1B_preprocessed_up_20/sa_000020
-    # gt_folder: /datasets/magirard/SA1B_preprocessed_up_20/sa_000020
     img_folder: null
     gt_folder: null
     file_list: /datasets/magirard/SA1B_preprocessed_up_150/file_list_train.txt
@@ -88,6 +86,8 @@ trainer:
   accelerator: cuda
   seed_value: 123
   val_epoch_freq: 5
+  save_dir: "experiment_5_pretrained_decoder"
+  compute_teacher: true
 
   model:
     _target_: training.model.sam2.SAM2Train
@@ -95,17 +95,9 @@ trainer:
       _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
       scalp: 0
       trunk:
-        _target_: sam2.modeling.backbones.hieradet.Hiera
-        embed_dim: ${model_params.embed_dim}
-        stages: [4, 5, 2]
-        global_att_blocks: [6, 8]
-        mlp_ratio: 2.5
-        window_spec: ${model_params.window_spec}
-        num_heads: 1 # Testing with 1 head also to reduce size
-        q_pool: 2
-        drop_path_rate: 0.1
-        input_size: ${model_params.input_size}
-        export: ${model_params.export}
+        _target_: sam2.modeling.backbones.mobilevitxs.MobileVitXS
+        exportable: ${model_params.export}
+        pretrained: true
       neck:
         _target_: sam2.modeling.backbones.image_encoder.FpnNeck
         position_encoding:
@@ -118,7 +110,7 @@ trainer:
         embed_dim: ${model_params.embed_dim}
         image_size: ${model_params.input_size}
         d_model: ${model_params.embed_dim}
-        backbone_channel_list: [256, 128, 64]
+        backbone_channel_list: [80, 64, 48]
         fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
         fpn_interp_model: nearest
 
@@ -181,7 +173,7 @@ trainer:
           num_layers: 2
 
     backbone_stride: 16
-    tiny_decoder: True
+    tiny_decoder: False # Use original SAM decoder
     tiny_encoder: True
     disable_memory: True
     export: ${model_params.export}
@@ -244,8 +236,9 @@ trainer:
 
     # I don't think that's such a good idea to freeze it ?
     # At least bad if not train on correct image size (bad position encoding)
-    # modules_to_freeze: ["sam_prompt_encoder"]
+    # modules_to_freeze: ["sam_mask_decoder"]
 
+    # KD used in experiment 1+
   teacher_model:
     _target_: training.model.sam2.SAM2Train
     image_encoder:
@@ -370,7 +363,7 @@ trainer:
     prob_to_use_pt_input_for_eval: 0.0
     prob_to_use_box_input_for_train: 0.5  # 0.5*0.5 = 0.25 prob to use box instead of points
     prob_to_use_box_input_for_eval: 0.0
-    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    prob_to_sample_from_gt_for_train: 0.5  # with a small prob, sampling correction points from GT mask instead of prediction errors
     num_frames_to_correct_for_train: 2  # iteratively sample on random 1~2 frames (always include the first frame)
     num_frames_to_correct_for_eval: 1  # only iteratively sample on first frame
     rand_frames_to_correct_for_train: True  # random #init-cond-frame ~ 2
@@ -385,7 +378,6 @@ trainer:
     forward_backbone_per_frame_for_eval: False # required when  doing kd with intermediates
 
     return_intermediate_embeddings: True
-
 
   data:
     train:
@@ -501,14 +493,15 @@ trainer:
         loss_dice: 1
         loss_iou: 1
         loss_class: 1
-        loss_kd_output: 5
-        loss_kd_intermediate: 5
+        loss_kd_output: 5 # 5 for other experiments
+        loss_kd_intermediate: 0 # 5 for other experiments
       supervise_all_iou: true
       iou_use_l1_loss: true
       pred_obj_scores: true
       focal_gamma_obj_score: 0.0
       focal_alpha_obj_score: -1.0
-      use_kd: true
+      use_kd_output: true
+      use_kd_intermediate: false
       kd_loss_type: "mse"
 
   distributed:
@@ -541,14 +534,13 @@ trainer:
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
         # better use the finetuned model for pos encoding on 128x128 images
-        checkpoint_path: ./checkpoints/sam2.1_hiera_base_plus_finetuned.pt # PATH to SAM 2.1 checkpoint
+        checkpoint_path: ./checkpoints/sam2.1_hiera_base_plus.pt # PATH to SAM 2.1 checkpoint, finetuned ??? trying without
         ckpt_state_dict_keys: ['model']
 
       selected_keys:
-        [
-          "sam_prompt_encoder",
-        ]
+        ["sam_prompt_encoder", "sam_mask_decoder"] # Nothing in experiment 1 (kd on output only)
     
+  # kd in experiment 1+
   checkpoint_teacher:
     resume_from: null
     save_dir: None
