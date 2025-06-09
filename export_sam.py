@@ -1,47 +1,213 @@
-from typing import Optional, Tuple, Any
-import torch
-from torch import nn
-import torch.nn.functional as F
-from torch.nn.init import trunc_normal_
-from torchvision import transforms
+# UltraTinySAM export script for IMX500 deployment
+# Made by: Maxime Girard, 2025
 
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+import argparse
+import copy
 import os
-from PIL import Image
-
-from sam2.modeling.sam2_base import SAM2Base
-
-from training.utils.train_utils import makedir, register_omegaconf_resolvers
-
-import torch
-from sam2.build_sam import build_sam2
-
-from hydra import initialize_config_module
+import sys
+from typing import Any, Optional, Tuple
 
 import model_compression_toolkit as mct
-import sys
-
-from torch.ao.quantization import (
-    prepare, convert, QConfig, float_qparams_weight_only_qconfig, QuantStub
-)
-from torch.ao.quantization.observer import MinMaxObserver
-
-import copy
-
 import numpy as np
-
+import torch
+import torch.nn.functional as F
 from fvcore.nn import FlopCountAnalysis, parameter_count
+from hydra import initialize_config_module
+from PIL import Image
+from sam2.build_sam import build_sam2
+from sam2.modeling.sam2_base import SAM2Base
+from torch import nn
+from torch.ao.quantization import (QConfig, QuantStub, convert,
+                                   float_qparams_weight_only_qconfig, prepare)
+from torch.ao.quantization.observer import MinMaxObserver
+from torch.nn.init import trunc_normal_
+from torchvision import transforms
+from training.utils.train_utils import makedir, register_omegaconf_resolvers
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 SAM_INPUT_SIZE = 128
 EMBED_DIM_DECODER = 256
-TARGET_POINT_X = SAM_INPUT_SIZE // 2
-TARGET_POINT_Y = SAM_INPUT_SIZE // 2
-IMG_DIR = "/datasets/magirard/SA1B_preprocessed_up_150/sa_000020"
 
-STATIC_POINT = False
-STATIC_LABELS = True # Required for onnx graph with quantization
-LABELS_MODE = "1-click"  # Options: "1-click", "3-clicks", "5-clicks", "gt-box"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Export UltraTinySAM for IMX500")
+    # config
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/ultratinysam/UltraTinySAM.yaml",
+        help="Path to the configuration file",
+    )
+    
+    # model checkpoint
+    parser.add_argument(
+        "--model_checkpoint",
+        type=str,
+        default="checkpoints/utsam.pt",
+        help="Path to the model checkpoint to load. Default is 'checkpoints/utsam.pt'.",
+    )
+    
+    # target input
+    parser.add_argument(
+        "--target_input_coords",
+        type=str,
+        default="128,128",
+        help="Target input coordinates for the model, in the format 'x,y'. Only if static point is set. Default is '128,128'.",
+    )
+    
+    # static point
+    parser.add_argument(
+        "--static_point",
+        action="store_true",
+        help="Use a static point for the model. Only 1-click input is supported. Required for deployment on IMX500. Default is False.",
+    )
+    
+    # static labels
+    parser.add_argument(
+        "--static_labels",
+        action="store_true",
+        help="Use static labels for the model. Required for quantization export. Default is False.",
+    )
+    
+    # labels mode
+    parser.add_argument(
+        "--labels_mode",
+        type=str,
+        default="1-click",
+        choices=["1-click", "3-clicks", "5-clicks", "gt-box"],
+        help="Labels mode for the model. Default is '1-click'.",
+    )
+    
+    # export fp
+    parser.add_argument(
+        "--export_fp",
+        action="store_true",
+        default=False,
+        help="Export the full precision model. Default is False.",
+    )
+    
+    # export quantized
+    parser.add_argument(
+        "--export_quant",
+        action="store_true",
+        default=True,
+        help="Export the quantized model. Default is True.",
+    )
+    
+    # exported quantized models
+    parser.add_argument(
+        "--exported_models",
+        type=str,
+        nargs="+",
+        default=["full"],
+        choices=["full", "encoder", "decoder"],
+        help="List of models/part of the model to export. Default is ['full'].",
+    )
+    
+    # quantization method
+    parser.add_argument(
+        "--quant_method",
+        type=str,
+        default="PTQ",
+        choices=["PTQ", "QAT", "GPTQ"],
+        help="Quantization method to use. Default is 'PTQ'. QAT only train the model with FakeQuantize blocks, then the checkpoint saved needs to be exported using PTQ for deployment.",
+    )
+    
+    # load checkpoint before PTQ
+    parser.add_argument(
+        "--load_ckpt_before_ptq",
+        action="store_true",
+        default=False,
+        help="Load the checkpoint (QAT checkpoint) before PTQ. Default is False.",
+    )
+    
+    # QAT checkpoint
+    parser.add_argument(
+        "--qat_ckpt",
+        type=str,
+        default="qat_model/ultra-tiny-sam-qat-0.pth",
+        help="Path to the QAT checkpoint to load before PTQ. Default is 'qat_model/ultra-tiny-sam-qat-0.pth'.",
+    )
+    
+    # save dir for QAT checkpoint
+    parser.add_argument(
+        "--export_dir_output",
+        type=str,
+        default="qat_model",
+        help="Directory to save the exported models. Default is 'qat_model'.",
+    )
+    
+    # Num batches for QAT
+    parser.add_argument(
+        "--max_batches",
+        type=int,
+        default=20,
+        help="Number of batches to use for QAT. Default is 20.",
+    )
+    
+    # batch size for QAT
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=32,
+        help="Batch size to use for QAT. Default is 32.",
+    )
+    
+    # Num epochs for QAT
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=1,
+        help="Number of epochs to use for QAT. Default is 1.",
+    )
+    
+    # Num samples for representative data
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=20,
+        help="Number of samples to use for representative data. Default is 20.",
+    )
+    
+    # image dir for representative data
+    parser.add_argument(
+        "--img_dir",
+        type=str,
+        default="datasets/SA1B_preprocessed_up_150/sa_000020",
+        help="Directory containing images for representative data. Default is 'datasets/SA1B_preprocessed_up_150/sa_000020'.",
+    )
+    
+    # dump the embeddings
+    parser.add_argument(
+        "--dump_coords_embeddings",
+        action="store_true",
+        default=False,
+        help="Dump the coordinates embeddings to a npy file. Only works with 1-click mode. Default is False.",
+    )
+    
+    args = parser.parse_args()
+    return args
+
+args = parse_args()
+
+TARGET_POINT_X, TARGET_POINT_Y = map(int, args.target_input_coords.split(","))
+if args.static_point:
+    STATIC_POINT = True
+    print(f"Using static point at ({TARGET_POINT_X}, {TARGET_POINT_Y})")
+else:
+    STATIC_POINT = False
+    print("Using dynamic point for the model")    
+    
+if args.static_labels:
+    STATIC_LABELS = True
+    print("Using static labels for the model")
+else:
+    STATIC_LABELS = False
+    print("Using dynamic labels for the model")
+    
 NUM_POINTS_PER_MODE = {
     "1-click": 1,
     "3-clicks": 3,
@@ -49,46 +215,45 @@ NUM_POINTS_PER_MODE = {
     "gt-box": 2,
 }
 
-NUM_POINTS = NUM_POINTS_PER_MODE[LABELS_MODE] # Number of points to use for the model
+if args.labels_mode in NUM_POINTS_PER_MODE:
+    LABELS_MODE = args.labels_mode
+    print(f"Using labels mode: {LABELS_MODE}")
+else:
+    raise ValueError(f"Invalid labels mode: {args.labels_mode}. Choose from {list(NUM_POINTS_PER_MODE.keys())}")
 
-EXPORT_FP = True
-EXPORTED_MODELS = ["full"]  # ["full", "encoder", "decoder"]
-EXPORT_QUANT = True
-QUANT_METHOD = "PTQ"  # PTQ or QAT, now trying with GPTQ
+NUM_POINTS = NUM_POINTS_PER_MODE[LABELS_MODE]
 
+IMG_DIR = args.img_dir
+NUM_SAMPLES = args.num_samples  # Number of samples to use for representative data
 
-# NAME_FP = f"ultra-tiny-sam-{LABELS_MODE}.onnx"  # Name of the FP model to export
-# NAME_FP_STATIC_PT = f"ultra-tiny-sam-static-{LABELS_MODE}.onnx"  # Name of the FP model with static point to export
-# NAME_FP_STATIC_LABELS = f"ultra-tiny-sam-static-labels-{LABELS_MODE}.onnx"  # Name of the FP model with static labels to export
-# NAME_PTQ = f"ptq-ultra-tiny-sam-{LABELS_MODE}.onnx"  # Name of the PTQ model to export
-# NAME_QAT = f"qat-ultra-tiny-sam-{LABELS_MODE}.onnx"  # Name of the QAT model to export
+assert args.export_fp or args.export_quant, "At least one of --export_fp or --export_quant must be set"
+EXPORT_FP = args.export_fp
+EXPORT_QUANT = args.export_quant
 
-NAME_FP = f"ultra-tiny-sam-{LABELS_MODE}-ft.onnx"  # Name of the FP model to export
-NAME_FP_STATIC_PT = f"ultra-tiny-sam-static-{LABELS_MODE}-ft.onnx"  # Name of the FP model with static point to export
-NAME_FP_STATIC_LABELS = f"ultra-tiny-sam-static-labels-{LABELS_MODE}-ft.onnx"  # Name of the FP model with static labels to export
-NAME_PTQ = f"ptq-ultra-tiny-sam-{LABELS_MODE}-ft.onnx"  # Name of the PTQ model to export
-NAME_QAT = f"qat-ultra-tiny-sam-{LABELS_MODE}-ft.onnx"  # Name of the QAT model to export
+EXPORTED_MODELS = args.exported_models
+assert EXPORTED_MODELS in ["full", "encoder", "decoder"], "Invalid exported models. Choose from ['full', 'encoder', 'decoder']"
 
-LOAD_CKPT_BEFORE_PTQ = True
-QAT_CKPT = "qat_model/ultra-tiny-sam-qat-0.pth"  # Path to the checkpoint to load before PTQ
-MAX_BATCHES = 20
+QUANT_METHOD = args.quant_method
 
-NUM_SAMPLES = 20
+NAME_FP = f"ultra-tiny-sam-{LABELS_MODE}.onnx"  # Name of the FP model to export
+NAME_FP_STATIC_PT = f"ultra-tiny-sam-static-{LABELS_MODE}.onnx"  # Name of the FP model with static point to export
+NAME_FP_STATIC_LABELS = f"ultra-tiny-sam-static-labels-{LABELS_MODE}.onnx"  # Name of the FP model with static labels to export
+NAME_PTQ = f"ptq-ultra-tiny-sam-{LABELS_MODE}.onnx"  # Name of the PTQ model to export
+NAME_QAT = f"qat-ultra-tiny-sam-{LABELS_MODE}.onnx"  # Name of the QAT model to export
 
-# EXPORT_FOR_DEPLOYMENT = True => removed
-EXPORT_DIR_OUTPUT = "qat_model"
+LOAD_CKPT_BEFORE_PTQ = args.load_ckpt_before_ptq
+QAT_CKPT = args.qat_ckpt
+MAX_BATCHES = args.max_batches  # Number of batches to use for QAT
+NUM_EPOCHS = args.num_epochs  # Number of epochs to use for QAT
+BATCH_SIZE = args.batch_size  # Batch size to use for QAT
 
-DUMP_COORDS_EMBEDDINGS = False
+EXPORT_DIR_OUTPUT = args.export_dir_output
+
+DUMP_COORDS_EMBEDDINGS = args.dump_coords_embeddings
 
 multimask_output = True
-# model_cfg = "configs/sam2.1/sam2.1_hiera_ultra_tiny.yaml"
-# sam2_checkpoint = f"./checkpoints/sam2.1_hiera_ultra_tiny_kde_big_objects.pt"
-# model_cfg = "configs/sam2.1/sam2.1_hiera_ultra_tiny_mobilevit.yaml"
-# sam2_checkpoint = f"./checkpoints/sam2.1_hiera_ultra_tiny_mobilevit.pt"
-model_cfg = "configs/sam2.1/sam2.1_hiera_ultra_tiny_mobilevit_v2.yaml"
-#sam2_checkpoint = f"./checkpoints/sam2.1_hiera_ultra_tiny_mobilevit_v2.pt"
-#sam2_checkpoint = "sam2_logs/configs/sam2.1_training/EXPERIMENT5gamma_PRETRAINED_DECODER.yaml/checkpoints/checkpoint.pt"
-sam2_checkpoint = "sam2_logs/configs/sam2.1_training/EXPERIMENT9_FINETUNING.yaml/checkpoints/checkpoint.pt"
+model_cfg = args.config
+sam2_checkpoint = args.model_checkpoint
 
 
 class SAM2ImageEncoder(nn.Module):
@@ -179,7 +344,7 @@ class SAM2ImageDecoder(nn.Module):
             sparse_embedding = self.sparse_embedding
         # print("[DEBUG] sparse shape", sparse_embedding.shape)
         if DUMP_COORDS_EMBEDDINGS:
-            assert LABELS_MODE == "1-click", "Only 1-click mode supported for now"
+            assert LABELS_MODE == "1-click", "Dump embeddings: Only 1-click mode supported for now"
             # Save the sparse embedding
             # verify the file does not exist
             if not os.path.exists("sparse_embedding.npy"):
@@ -892,7 +1057,8 @@ if "full" in EXPORTED_MODELS and EXPORT_QUANT:
         #     )
         # )
         import torch.quantization
-        from torch.quantization import get_default_qat_qconfig, prepare_qat, convert
+        from torch.quantization import (convert, get_default_qat_qconfig,
+                                        prepare_qat)
 
         model_fp32 = sam2_wrapper.train()
 
@@ -914,29 +1080,23 @@ if "full" in EXPORTED_MODELS and EXPORT_QUANT:
 
         # First the datloaders
         # === IMPORTS ===
+        from functools import partial
+
+        import cv2
+        import numpy as np
+        from torch.utils.data import DataLoader
+        from tqdm import tqdm
         from training.dataset.sam2_datasets import TorchTrainMixedDataset
+        from training.dataset.transforms import (ColorJitter, ComposeAPI,
+                                                 NormalizeAPI, RandomGrayscale,
+                                                 RandomHorizontalFlip,
+                                                 RandomResizeAPI, ToTensorAPI)
         from training.dataset.vos_dataset import VOSDataset
         from training.dataset.vos_raw_dataset import SA1BRawDataset
         from training.dataset.vos_sampler import RandomUniformSampler
-        from training.dataset.transforms import (
-            ComposeAPI,
-            RandomHorizontalFlip,
-            RandomResizeAPI,
-            ColorJitter,
-            RandomGrayscale,
-            ToTensorAPI,
-            NormalizeAPI,
-        )
         from training.utils.data_utils import collate_fn
-        from functools import partial
-        from torch.utils.data import DataLoader
-        from tqdm import tqdm
-        import numpy as np
-        import cv2
-        
 
         # === SETUP ===
-
         # === CONFIGURATION VALUES (replace with actual values or config access) ===
         train_img_folder = None
         train_gt_folder = None
@@ -1134,9 +1294,11 @@ if "full" in EXPORTED_MODELS and EXPORT_QUANT:
         # Use a loss modified from fns_losses
             
         # === CUSTOM LOSS ===
-        from training.trainer import CORE_LOSS_KEY
-        from training.utils.distributed import get_world_size, is_dist_avail_and_initialized
         from collections import defaultdict
+
+        from training.trainer import CORE_LOSS_KEY
+        from training.utils.distributed import (get_world_size,
+                                                is_dist_avail_and_initialized)
 
         def dice_loss(inputs, targets, num_objects):
             inputs = inputs.sigmoid()
@@ -1273,19 +1435,15 @@ if "full" in EXPORTED_MODELS and EXPORT_QUANT:
         )
 
         # Use the same optimizer
+        from fvcore.common.param_scheduler import (ConstantParamScheduler,
+                                                   CosineParamScheduler)
         from torch.optim import AdamW
-        from fvcore.common.param_scheduler import (
-            CosineParamScheduler,
-            ConstantParamScheduler,
-        )
-        from training.optimizer import (
-            layer_decay_param_modifier,
-            map_scheduler_cfgs_to_param_groups,
-            GradientClipper,
-            get_module_cls_to_param_names,
-            _unix_pattern_to_parameter_names,
-            validate_param_group_params,
-        )
+        from training.optimizer import (GradientClipper,
+                                        _unix_pattern_to_parameter_names,
+                                        get_module_cls_to_param_names,
+                                        layer_decay_param_modifier,
+                                        map_scheduler_cfgs_to_param_groups,
+                                        validate_param_group_params)
 
         param_allowlist = {name for name, _ in qat_model.named_parameters()}
         named_parameters = {
@@ -1396,29 +1554,6 @@ if "full" in EXPORTED_MODELS and EXPORT_QUANT:
             maximize=False,
             fused=None,
         )
-        # print optimizer stae dict keys
-        # print(f"Optimizer state dict keys: {optimizer.state_dict().keys()}")
-        # # print number of param groups
-        # dict_k = optimizer.state_dict()
-        # print(f"Optimizer number of param groups: {len(dict_k['param_groups'])}")
-        # # print the groups
-        # for i, group in enumerate(dict_k["param_groups"]):
-        #     print(f"Group {i}:")
-        #     for k, v in group.items():
-        #         print(f"  {k}: {v}")
-        # # load the optimizer state dict from the original training
-        # optim_dict = torch.load(sam2_checkpoint)["optimizer"]
-        # print(f"Optimizer state dict keys: {optim_dict.keys()}")
-        # print(f"Optimizer state dict keys: {len(optim_dict['param_groups'])}")
-        # # print the groups
-        # for i, group in enumerate(optim_dict["param_groups"]):
-        #     print(f"Group {i}:")
-        #     for k, v in group.items():
-        #         print(f"  {k}: {v}")
-        # optimizer.load_state_dict(optim_dict)
-        # optimizer = optimizer.to(device_qat)
-        
-        # print(f"Optimizer state dict keys: {optimizer.state_dict().keys()}")
 
         # === Setup gradient clipper ===
         gradient_clipper = GradientClipper(max_norm=0.1, norm_type=2)
@@ -1427,74 +1562,10 @@ if "full" in EXPORTED_MODELS and EXPORT_QUANT:
         # batch size of 1 (mandatory with our ONNX wrapper)
         # do just few epochs, 1 point per mask
         # low lr
-        num_epochs = 1
-        VIRTUAL_BATCH_SIZE = 32
+        VIRTUAL_BATCH_SIZE = BATCH_SIZE
         GRAD_ACCUM_STEPS = VIRTUAL_BATCH_SIZE  # since physical batch_size == 1
-
-        # Freezing some parts
-        # print all named parameters
-        # first freeze all the parameters
-        # for name, param in qat_model.named_parameters():
-        #     print(f"Name: {name}, requires_grad: {param.requires_grad}")
-        #     param.requires_grad = False
-        #     # then unfreeze the ones we want to train
-        #     if "encoder_model_sam_mask_decoder_output_hypernetworks" in name:
-        #         param.requires_grad = True
-        #     if "encoder_model_sam_mask_decoder_iou" in name:
-        #         param.requires_grad = True
-        #     if "matmul_1_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_34_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_35_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_36_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_38_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_39_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_40_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_42_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_43_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_44_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "add_45_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "mean_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "sqrt_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "mean_1_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "truediv_1_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "mul_58_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "sigmoid_activation_holder_quantizer" in name:
-        #         param.requires_grad = True
-        #     if "encoder_model_sam_mask_decoder" in name:
-        #         param.requires_grad = True
-        #     if "scaled_dot_product_attention_12" in name:
-        #         param.requires_grad = True
-        #     if "scaled_dot_product_attention_13" in name:
-        #         param.requires_grad = True
-        #     if "scaled_dot_product_attention_14" in name:
-        #         param.requires_grad = True
-        #     if "threshold_tensor" in name:
-        #         param.requires_grad = False # => Careful, this one need to be fixed
-            
-                    
-        # print all frozen parameters
-        for name, param in qat_model.named_parameters():
-            #print(f"Name: {name}, requires_grad: {param.requires_grad}")
-            if param.requires_grad:
-                print(f"  {name} is trainable")
-                    
-        for epoch in range(num_epochs):  # e.g. num_epochs = 1
+                                
+        for epoch in range(NUM_EPOCHS):  # e.g. num_epochs = 1
             num_virtual_batches = (len(train_dataloader) + GRAD_ACCUM_STEPS - 1) // GRAD_ACCUM_STEPS
 
             with tqdm(total=num_virtual_batches, desc=f"Epoch {epoch+1}") as pbar:
@@ -1641,48 +1712,4 @@ if "full" in EXPORTED_MODELS and EXPORT_QUANT:
                 f"{EXPORT_DIR_OUTPUT}/ultra-tiny-sam-qat-{epoch}.pth",
             )
             
-            print(f"Epoch {epoch+1} completed. Model saved as 'ultra-tiny-sam-qat-{epoch}.pt'.")        
-
-        ### EXPORT THE MODEL ###
-        ## Wrapper for qat_model with fixed coords input
-        # if EXPORT_FOR_DEPLOYMENT:
-        #     class FixedCoordsWrapper(nn.Module):
-        #         def __init__(self, model):
-        #             super().__init__()
-        #             self._model = model                   
-        #             # This is set to make the function 
-        #             self.coords = torch.tensor([[[64.0, 64.0]]]).to(device_qat)  # Fixed coordinates
-
-        #         def forward(self, x):
-        #             return self._model(x, self.coords)
-
-        #         def __getattr__(self, name):
-        #             # Delegate attribute access to the underlying model
-        #             if name == '_model':
-        #                 return super().__getattr__(name)
-        #             return getattr(self._model, name)      
-                            
-        #     quantized_model = (
-        #         mct.qat.pytorch_quantization_aware_training_finalize_experimental(
-        #             qat_model
-        #         )            
-        #     )
-            
-        #     quantized_model_fixed = FixedCoordsWrapper(quantized_model)
-            
-        #     def representative_data_gen_static():
-        #         for file in os.listdir(IMG_DIR)[:NUM_SAMPLES]:
-        #             if file.lower().endswith((".jpg", ".jpeg", ".png")):
-        #                 img_path = os.path.join(IMG_DIR, file)
-        #                 img = Image.open(img_path).convert("RGB")
-        #                 img_tensor = transform(img).unsqueeze(0)
-        #                 #print("rep data shape", img_tensor.shape)
-        #                 yield [img_tensor]
-                        
-        #     mct.exporter.pytorch_export_model(
-        #         quantized_model_fixed,
-        #         repr_dataset=representative_data_gen_static,
-        #         save_model_path=f"{EXPORT_DIR_OUTPUT}/qat-ultra-tiny-sam-{epoch}.onnx",
-        #         onnx_opset_version=20,
-        #     )
-                            
+            print(f"Epoch {epoch+1} completed. Model saved as 'ultra-tiny-sam-qat-{epoch}.pt'.")                                    
