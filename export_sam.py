@@ -231,7 +231,9 @@ EXPORT_FP = args.export_fp
 EXPORT_QUANT = args.export_quant
 
 EXPORTED_MODELS = args.exported_models
-assert EXPORTED_MODELS in ["full", "encoder", "decoder"], "Invalid exported models. Choose from ['full', 'encoder', 'decoder']"
+ALLOWED_EXPORTED_MODELS = {"full", "encoder", "decoder"}
+assert all(m in ALLOWED_EXPORTED_MODELS for m in EXPORTED_MODELS), \
+    f"Invalid exported models: {EXPORTED_MODELS}. Choose from {list(ALLOWED_EXPORTED_MODELS)}"
 
 QUANT_METHOD = args.quant_method
 
