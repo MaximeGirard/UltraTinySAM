@@ -21,7 +21,7 @@ def list_images_in_folders(base_dir, folders, output_file):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='List images in folders and save to text files for train/val.')
-    parser.add_argument('--base_dir', type=str, default='.', help='Base directory containing the folders.')
+    parser.add_argument('--base_dir', type=str, default='../datasets/SA1B_preprocessed_up_150', help='Base directory containing the folders.')
     parser.add_argument('--train_folders', nargs='+', default=['sa_000024', 'sa_000020', 'sa_000028', 'sa_000021', 'sa_000022', 'sa_000027', 'sa_000026', 'sa_000025', 'sa_000023'], help='List of training folders to search for images.')
     parser.add_argument('--val_folders', nargs='+', default=['sa_000029'], help='List of validation folders to search for images.')
     parser.add_argument('--train_output_file', type=str, default='file_list_train.txt', help='Name of the training output text file.')

@@ -16,9 +16,9 @@ from tqdm import tqdm
 # PARAMETERS
 def parse_args():
     parser = argparse.ArgumentParser(description="Preprocess SA-1B dataset tars with resizing and filtering.")
-    parser.add_argument('--target-dir', type=str, default='datasets/SA1B_preprocessed_up_150',
+    parser.add_argument('--target-dir', type=str, default='../datasets/SA1B_preprocessed_up_150',
                         help='Directory to save preprocessed images and annotations.')
-    parser.add_argument('--temp-extract-dir', type=str, default='/datasets/magirard/temp_extract',
+    parser.add_argument('--temp-extract-dir', type=str, default='../datasets/temp_extract',
                         help='Temporary directory for extracting tar files.')
     parser.add_argument('--image-size', type=int, nargs=2, default=[128, 128],
                         help='Output image size as two integers: width height.')
@@ -26,7 +26,7 @@ def parse_args():
                         help='Minimum area for valid masks. Default is 150.')
     parser.add_argument('--num-workers', type=int, default=12,
                         help='Number of parallel workers.')
-    parser.add_argument('--to-download-file', type=str, default='datasets/to_download.txt',
+    parser.add_argument('--to-download-file', type=str, default='../datasets/to_download.txt',
                         help='Path to file listing tar files to download and process.')
     return parser.parse_args()
 
