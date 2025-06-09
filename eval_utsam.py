@@ -31,7 +31,7 @@ def parse_arguments():
     
     # Dataset arguments
     parser.add_argument("--img-dir", default="datasets/COCO/val2017", help="Path to COCO/LVIS images directory")
-    parser.add_argument("--ann-file", default="datasets/COCO/annotations/instances_val2017.json", required=True, help="Path to COCO/LVIS annotations file")
+    parser.add_argument("--ann-file", default="datasets/COCO/annotations/instances_val2017.json", help="Path to COCO/LVIS annotations file")
     
     # Model arguments
     parser.add_argument("--fp-model", help="Path to floating-point ONNX model")
@@ -42,12 +42,10 @@ def parse_arguments():
     parser.add_argument("--max-images", type=int, default=100, help="Maximum number of images to evaluate")
     parser.add_argument("--min-area", type=int, default=150, help="Minimum mask area threshold")
     parser.add_argument("--click-mode", choices=["1-click", "3-clicks", "5-clicks", "gt-box"], 
-                       default="gt-box", help="Click mode for model input")
+                       default="1-click", help="Click mode for model input")
     
     # Visualization arguments
     parser.add_argument("--visualize", action="store_true", help="Generate visualization outputs")
-    parser.add_argument("--visualize-all-annotations", action="store_true", 
-                       help="Visualize all annotations (not just first per image)")
     parser.add_argument("--display-only-best-mask", action="store_true", 
                        help="Display only the best mask in visualizations")
     
@@ -67,12 +65,29 @@ MAX_IMAGES = args.max_images
 MIN_AREA = args.min_area
 CLICK_MODE = args.click_mode
 VISUALIZE = args.visualize
-VISUALIZE_ALL_ANNOTATIONS = args.visualize_all_annotations
 DISPLAY_ONLY_BEST_MASK = args.display_only_best_mask
 VISUALIZE_DIR = "visualizations_" + CLICK_MODE
 
 USE_FP = args.fp_model is not None
 USE_QUANTIZED = args.quantized_model is not None
+
+ONNX_MODEL_PATH = args.fp_model if USE_FP else None
+ONNX_MODEL_Q_PATH = args.quantized_model if USE_QUANTIZED else None
+
+transform = transforms.Compose([
+    transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+if USE_FP:
+    ort_session = ort.InferenceSession(ONNX_MODEL_PATH, providers=["CPUExecutionProvider"])
+if USE_QUANTIZED:
+    session_options = mctq.get_ort_session_options()
+    session_options.enable_mem_reuse = False
+    ort_session_q = ort.InferenceSession(ONNX_MODEL_Q_PATH, session_options, providers=["CPUExecutionProvider"])
+
 
 def get_image_filename_from_lvis(img_info):
     """Extract filename from LVIS coco_url field"""
@@ -121,30 +136,31 @@ def visualize_multiple_predictions_vs_gt(img, gt_masks, pred_masks, point_coords
     plt.close()
 
 
-def run_model(img_pil, coords, labels, ort_session_fp=None, ort_session_q=None, transform=None, input_size=128):
+def run_model(img_pil, coords, labels):
     img_tensor = transform(img_pil).unsqueeze(0).numpy()
     point_coords = np.array([coords], dtype=np.float32)
     point_labels = np.array([labels], dtype=np.float32)
 
     result = {}
 
-    if ort_session_fp:
-        outputs = ort_session_fp.run(None, {
+    if USE_FP:
+        outputs = ort_session.run(None, {
             "image": img_tensor,
             "point_coords": point_coords,
+            #"point_labels": point_labels => now fixed in the model
         })
         masks, iou_predictions = outputs
-        masks = F.interpolate(torch.from_numpy(masks), size=(input_size, input_size), mode='bilinear', align_corners=False).numpy()
+        masks = F.interpolate(torch.from_numpy(masks), size=(INPUT_SIZE, INPUT_SIZE), mode='bilinear', align_corners=False).numpy()
         binary_masks = [(masks[0][idx] > 0).astype(np.uint8) for idx in range(3)]
         result["fp"] = (binary_masks, iou_predictions[0])
 
-    if ort_session_q:
+    if USE_QUANTIZED:
         outputs_q = ort_session_q.run(None, {
             "input": img_tensor,
             "inputs.3": point_coords,
         })
         masks_q, iou_predictions_q = outputs_q
-        masks_q = F.interpolate(torch.from_numpy(masks_q), size=(input_size, input_size), mode='bilinear', align_corners=False).numpy()
+        masks_q = F.interpolate(torch.from_numpy(masks_q), size=(INPUT_SIZE, INPUT_SIZE), mode='bilinear', align_corners=False).numpy()
         binary_masks_q = [(masks_q[0][idx] > 0).astype(np.uint8) for idx in range(3)]
         result["quantized"] = (binary_masks_q, iou_predictions_q[0])
 
@@ -155,7 +171,6 @@ def compute_iou(mask1, mask2):
     intersection = np.logical_and(mask1, mask2).sum()
     union = np.logical_or(mask1, mask2).sum()
     return intersection / union if union != 0 else 0.0
-
 
 def compute_ap(tp, fp, n_gt):
     tp_cum = np.cumsum(tp)
@@ -171,10 +186,8 @@ def compute_ap(tp, fp, n_gt):
         ap += p / 11.0
     return ap
 
-
-def manual_eval(predictions, coco_gt, min_area=150, iou_thresholds=np.arange(0.5, 1.0, 0.05)):
+def manual_eval(predictions, coco_gt, iou_thresholds=np.arange(0.5, 1.0, 0.05)):
     aps = []
-    total_instances = 0
 
     for iou_thresh in iou_thresholds:
         image_to_gts = defaultdict(list)
@@ -185,7 +198,7 @@ def manual_eval(predictions, coco_gt, min_area=150, iou_thresholds=np.arange(0.5
             anns = coco_gt.loadAnns(coco_gt.getAnnIds(imgIds=img_id))
             for ann in anns:
                 mask = coco_gt.annToMask(ann).astype(bool)
-                if mask.sum() >= min_area:
+                if mask.sum() >= MIN_AREA:
                     image_to_gts[img_id].append({
                         "category_id": ann["category_id"],
                         "used": False,
@@ -247,18 +260,6 @@ transform = transforms.Compose([
                         std=[0.229, 0.224, 0.225])
 ])
 
-# Load models
-ort_session = None
-ort_session_q = None
-
-if USE_FP:
-    ort_session = ort.InferenceSession(args.fp_model, providers=["CPUExecutionProvider"])
-    
-if USE_QUANTIZED:
-    session_options = mctq.get_ort_session_options()
-    session_options.enable_mem_reuse = False
-    ort_session_q = ort.InferenceSession(args.quantized_model, session_options, providers=["CPUExecutionProvider"])
-
 # Setup COCO evaluation
 coco = COCO(COCO_ANN_FILE)
 image_ids = coco.getImgIds()
@@ -277,6 +278,9 @@ if VISUALIZE:
 for img_id in tqdm(image_ids):
     img_info = coco.loadImgs(img_id)[0]
     
+    image_url = img_info.get('coco_url', None)
+    
+    # Get the correct filename for LVIS
     filename = get_image_filename_from_lvis(img_info)
     img_path = os.path.join(COCO_IMG_DIR, filename)
 
@@ -341,7 +345,7 @@ for img_id in tqdm(image_ids):
                     coords_input.append([cx, cy])
                     labels_input.append(1)
 
-        model_outputs = run_model(img, coords_input, labels_input, ort_session, ort_session_q, transform, INPUT_SIZE)
+        model_outputs = run_model(img, coords_input, labels_input)
     
         if "fp" in model_outputs:
             masks_fp, iou_fp = model_outputs["fp"]
@@ -381,8 +385,7 @@ for img_id in tqdm(image_ids):
                 visualize_multiple_predictions_vs_gt(
                     img_resized, gt_masks_list, [pred_masks], coords_list,
                     [float(np.max(iou_fp))],
-                    save_path=os.path.join(VISUALIZE_DIR, f"img{img_id}_{ann['id']}_fp.jpg"),
-                    click_mode=CLICK_MODE
+                    save_path=os.path.join(VISUALIZE_DIR, f"img{img_id}_{ann['id']}_fp.jpg")
                 )
 
             if "quantized" in model_outputs:
@@ -392,12 +395,8 @@ for img_id in tqdm(image_ids):
                 visualize_multiple_predictions_vs_gt(
                     img_resized, gt_masks_list, [pred_masks_q], coords_list,
                     [float(np.max(iou_q))],
-                    save_path=os.path.join(VISUALIZE_DIR, f"img{img_id}_{ann['id']}_q.jpg"),
-                    click_mode=CLICK_MODE
+                    save_path=os.path.join(VISUALIZE_DIR, f"img{img_id}_{ann['id']}_q.jpg")
                 )
-
-        if not VISUALIZE_ALL_ANNOTATIONS:
-            break
 
 # Save predictions
 with open("predictions_fp.json", "w") as f:
@@ -412,11 +411,11 @@ if USE_FP:
         predictions_fp = json.load(f)
 
     print("\n=== [Manual Evaluation for FP Model] ===")
-    manual_eval(predictions_fp, coco, MIN_AREA)
+    manual_eval(predictions_fp, coco)
 
 if USE_QUANTIZED:
     with open("predictions_quant.json", "r") as f:
         predictions_quant = json.load(f)
 
     print("\n=== [Manual Evaluation for Quantized Model] ===")
-    manual_eval(predictions_quant, coco, MIN_AREA)
+    manual_eval(predictions_quant, coco)

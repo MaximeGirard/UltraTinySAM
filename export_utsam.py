@@ -86,15 +86,15 @@ def parse_args():
         "--export_fp",
         action="store_true",
         default=False,
-        help="Export the full precision model. Default is False.",
+        help="Export the full precision model.",
     )
     
     # export quantized
     parser.add_argument(
         "--export_quant",
         action="store_true",
-        default=True,
-        help="Export the quantized model. Default is True.",
+        default=False,
+        help="Export the quantized model.",
     )
     
     # exported quantized models
