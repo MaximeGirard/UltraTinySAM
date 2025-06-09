@@ -2,9 +2,7 @@
 model_params:
   input_size: 128
   embed_dim: 64
-  window_spec: [8, 4, 4] ## Careful! depend on input size
-  export: True
-
+  export: True # use the IMX500 workarounds
 
 model:
   _target_: training.model.sam2.SAM2Train

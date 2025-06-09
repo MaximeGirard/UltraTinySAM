@@ -16,7 +16,6 @@ scratch:
 model_params:
   input_size: 128
   embed_dim: 64
-  window_spec: [8, 4, 4] ## Careful! depend on input size
   export: False
 
 dataset:
@@ -24,11 +23,11 @@ dataset:
   train:
     img_folder: null
     gt_folder: null
-    file_list: /datasets/magirard/SA1B_preprocessed_up_150/file_list_train.txt
+    file_list: datasets/SA1B_preprocessed_up_150/file_list_train.txt
   val:
     img_folder: null
     gt_folder: null
-    file_list: /datasets/magirard/SA1B_preprocessed_up_150/file_list_val.txt
+    file_list: datasets/SA1B_preprocessed_up_150/file_list_val.txt
   multiplier: 2
 
 # Video transforms
@@ -86,7 +85,7 @@ trainer:
   accelerator: cuda
   seed_value: 123
   val_epoch_freq: 5
-  save_dir: "experiment_5_pretrained_decoder"
+  save_dir: "experiment_3_pretrained_decoder"
   compute_teacher: true
 
   model:
@@ -233,10 +232,6 @@ trainer:
     forward_backbone_per_frame_for_eval: False # required when  doing kd with intermediates
 
     return_intermediate_embeddings: True
-
-    # I don't think that's such a good idea to freeze it ?
-    # At least bad if not train on correct image size (bad position encoding)
-    # modules_to_freeze: ["sam_mask_decoder"]
 
     # KD used in experiment 1+
   teacher_model:
